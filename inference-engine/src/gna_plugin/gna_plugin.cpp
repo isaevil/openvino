@@ -64,6 +64,8 @@
 #include "transformations/convert_matmul_to_pointwise_convolution.hpp"
 #include "transformations/split_convolution_with_large_buffer_size.hpp"
 #include "transformations/handle_transposes_around_matmul.hpp"
+#include "transformations/decompose_2d_convolution.hpp"
+#include "transformations/convert_padded_to_valid_convolution.hpp"
 
 #include <ngraph/opsets/opset7.hpp>
 
@@ -412,7 +414,9 @@ void GNAPlugin::InitGNADevice() {
                 config.swExactMode,
                 gnaFlags->gna_lib_async_threads_num,
                 gnaFlags->gna_openmp_multithreading,
-                gnaFlags->performance_counting);
+                gnaFlags->performance_counting,
+                !config.dumpXNNPath.empty(),
+                GetDeviceVersionFromString(config.dumpXNNGeneration));
 #endif
     size_t page_size_bytes = 4096;
     gnamem = std::make_shared<gna_memory_type>(memory::make_polymorph<memory::GNAAllocator>(gnadevice), page_size_bytes);
@@ -481,11 +485,13 @@ void GNAPlugin::UpdateInputScaleFromNetwork(InferenceEngine::CNNNetwork & networ
             auto fp32eq = [](float p1, float p2) -> bool {
                 return (std::abs(p1 - p2) <= 0.00001f * std::min(std::abs(p1), std::abs(p2)));
             };
-            float scaleInput = (fqLayer.getLevels() - 1) / (inputRange.second[0] - inputRange.first[0]);
+            // GNA input is always quantized to int16, so number of levels can't be greater than max uint16
+            size_t levels = std::min(fqLayer.getLevels(), static_cast<size_t>(std::numeric_limits<uint16_t>::max() + 1));
+            float scaleInput = (levels - 1) / (inputRange.second[0] - inputRange.first[0]);
             auto minAbsVal = std::min(std::abs(inputRange.second[0]), std::abs(inputRange.first[0]));
             auto maxAbsVal = std::max(std::abs(inputRange.second[0]), std::abs(inputRange.first[0]));
             if (fp32eq(minAbsVal, 0.0f) && !fp32eq(maxAbsVal, 0.0f)) {
-                scaleInput = (fqLayer.getLevels() - 1) / (2 * maxAbsVal);
+                scaleInput = (levels - 1) / (2 * maxAbsVal);
             }
 
             IE_ASSERT(config.inputScaleFactors.size() > inputIdx);
@@ -667,6 +673,16 @@ void GNAPlugin::AddDebugProperties(const InferenceEngine::CNNLayerPtr layer,
 
 void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
     std::shared_ptr<InferenceEngine::details::CNNNetworkImpl> convertedNetwork;
+
+    if (!gnaFlags->sw_fp32) {
+        InitGNADevice();
+    }
+
+    std::string effectiveGnaCompileTarget = config.gnaCompileTarget;
+    if (gnadevice) {
+        effectiveGnaCompileTarget = gnadevice->getEffectiveGnaCompileTarget();
+    }
+
     if (_network.getFunction()) {
         CNNNetwork clonedNetwork = InferenceEngine::cloneNetwork(_network);
         const auto& graph = clonedNetwork.getFunction();
@@ -675,6 +691,10 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
         // WA: ConvertPriorBox must be executed before the 1st ConstantFolding pass
         manager.register_pass<ngraph::pass::ConvertPriorBox>();
         manager.register_pass<ngraph::pass::CommonOptimizations>();
+        manager.register_pass<ConvertPaddedToValidConv>();
+        manager.register_pass<Decompose2DConvTransposedWithBiasAF>(effectiveGnaCompileTarget, config.gnaPrecision);
+        manager.register_pass<Decompose2DConvTransposedWithBias>(effectiveGnaCompileTarget, config.gnaPrecision);
+        manager.register_pass<Decompose2DConv>(effectiveGnaCompileTarget, config.gnaPrecision);
         // TODO enable this transformation for networks with convolutions
         if (!ngraph::op::util::has_op_with_type<ngraph::opset7::Convolution>(graph)) {
             manager.register_pass<ConvertMatmulWithFqToPointWiseConvolution>();
@@ -685,9 +705,9 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
         manager.register_pass<SplitConvolutionWithBias>();
         manager.register_pass<SplitConvolution>();
         manager.register_pass<HandleTransposesAroundMatMul>();
-        manager.register_pass<SwapInputMatMul>();
-        manager.register_pass<SwapInputMatMulWithBias>();
         manager.register_pass<SwapInputMatMulWithFq>();
+        manager.register_pass<SwapInputMatMulWithBias>();
+        manager.register_pass<SwapInputMatMul>();
         manager.register_pass<InsertTransposeAfterConvOrPool>();
         manager.register_pass<ReorderActivationAndPooling>();
         manager.register_pass<ngraph::pass::ConvertOpSet3ToOpSet2>();
@@ -875,15 +895,16 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
     // fill in extra storage with memory layers
     graphCompiler.fillMemoryConnections(memoryPairs);
 
-    if (!graphCompiler.memory_connection.empty()) {
+    if (!graphCompiler.memory_connection.empty() && gnaFlags->gna_lib_async_threads_num != 1) {
+        // TODO: check if updating the number of threads is needed for sw_fp32
         gnaFlags->gna_lib_async_threads_num = 1;
+        if (!gnaFlags->sw_fp32)
+            InitGNADevice();
     }
 
     if (gnaFlags->sw_fp32) {
         gnamem.reset(new gna_memory_type(memory::make_polymorph<std::allocator<uint8_t>>()));
         graphCompiler.setGNAMemoryPtr(gnamem);
-    } else {
-        InitGNADevice();
     }
 
     // keep inputs information and create input primitives
@@ -991,10 +1012,11 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
 #else
     nnets.emplace_back(make_shared<CPPWrapper<intel_nnet_type_t>>(), -1, InferenceEngine::BlobMap());
 #endif
+
     if (!gnaFlags->sw_fp32 && !graphCompiler.dnnComponents.components.empty()) {
         // number of layer gets calculated inside that InitGNAStruct function
 #if GNA_LIB_VER == 2
-        dnn->InitGNAStruct(&std::get<0>(gnaModels.front())->obj);
+        dnn->InitGNAStruct(&std::get<0>(gnaModels.front())->obj, effectiveGnaCompileTarget);
 #else
         dnn->InitGNAStruct(&std::get<0>(nnets.front())->obj);
 #endif
@@ -1005,7 +1027,7 @@ void GNAPlugin::LoadNetwork(CNNNetwork & _network) {
 #if GNA_LIB_VER == 2
         gnaModels.push_back(std::make_tuple(make_shared<CPPWrapper<Gna2Model>>()));
         // this can be improved by just copy all structures, but we are too lazy
-        dnn->InitGNAStruct(&std::get<0>(gnaModels.back())->obj);
+        dnn->InitGNAStruct(&std::get<0>(gnaModels.back())->obj, effectiveGnaCompileTarget);
 #else
         nnets.emplace_back(make_shared<CPPWrapper<intel_nnet_type_t>>(), -1, InferenceEngine::BlobMap());
         dnn->InitGNAStruct(&std::get<0>(nnets.back())->obj);
@@ -1567,6 +1589,18 @@ InferenceEngine::IExecutableNetworkInternal::Ptr GNAPlugin::ImportNetwork(std::i
             outputsDataMap,
             transpose_inputs_info,
             transpose_outputs_info);
+
+    // If scale factors are defined in configuration we still need to use them instead of imported values,
+    // for example to change the scale factors for the old models.
+    if (!config.inputScaleFactors.empty()) {
+        IE_ASSERT(config.inputScaleFactors.size() <= inputsDesc->inputScaleFactors.size());
+        for (size_t i = 0; i < config.inputScaleFactors.size(); ++i) {
+            if (config.inputScaleFactors[i] != GNAPluginNS::kScaleFactorDefault) {
+                gnalog() << "[Import Network] Using input scale factor defined in configuration for input " << i << std::endl;
+                inputsDesc->inputScaleFactors[i] = config.inputScaleFactors[i];
+            }
+        }
+    }
 
 #if GNA_LIB_VER == 2
     auto getOrientation = [](Gna2Operation & gnaOperation) {
